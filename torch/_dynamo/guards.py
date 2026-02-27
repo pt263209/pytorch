@@ -4892,3 +4892,119 @@ def install_guard(*guards: Guard, skip: int = 0) -> None:
         if is_from_skip_guard_source(guard.originating_source):
             continue
         add(guard, collect_debug_stack=collect_debug_stack, skip=skip + 1)
+
+
+# ---------------------------------------------------------------------------
+# Guard value dispatch table
+#
+# Maps guard type names (returned by Guard.create_fn_name()) to handlers
+# that extract a value at cache-build time and check it at cache-lookup time.
+# Used by invoke_subgraph_cache to avoid duplicating per-guard-type logic in
+# parallel if/elif chains.
+#
+# The extract function captures the minimum information from the original guard
+# needed to re-evaluate it later (not necessarily the "expected value" — e.g.
+# for NOT_PRESENT_IN_GENERIC_DICT it captures the attr name).
+#
+# Guards not yet supported (return None from build_auto_cache_condition):
+#   FUNCTION_MATCH, NN_MODULE, DATA_PTR_MATCH, LENGTH_CHECK,
+#   DEFAULT_DEVICE, DETERMINISTIC_ALGORITHMS, TORCH_FUNCTION_STATE,
+#   GRAD_MODE, SHAPE_ENV
+# ---------------------------------------------------------------------------
+
+
+class GuardValueHandler(NamedTuple):
+    extract: Any  # (guard, value) -> saved_info
+    check: Any  # (value, saved_info) -> bool
+    resolve_base_only: bool = False
+
+
+_SKIP_GUARD = object()
+
+
+def _extract_tensor_metadata(t: torch.Tensor) -> tuple:
+    return (t.shape, t.stride(), t.dtype, t.device, t.requires_grad)
+
+
+def _extract_closure(guard: Any, value: Any) -> Any:
+    if type(value) is types.FunctionType and hasattr(value, "__code__"):
+        return value.__code__
+    return id(value)
+
+
+def _check_closure(value: Any, expected: Any) -> bool:
+    if type(value) is types.FunctionType and hasattr(value, "__code__"):
+        return value.__code__ is expected
+    return id(value) == expected
+
+
+GUARD_VALUE_DISPATCH: dict[str, GuardValueHandler | object] = {
+    "TENSOR_MATCH": GuardValueHandler(
+        extract=lambda guard, value: _extract_tensor_metadata(value),
+        check=lambda value, expected: (
+            isinstance(value, torch.Tensor)
+            and _extract_tensor_metadata(value) == expected
+        ),
+    ),
+    "TYPE_MATCH": GuardValueHandler(
+        extract=lambda guard, value: type(value),
+        check=lambda value, expected: type(value) is expected,
+    ),
+    "EQUALS_MATCH": GuardValueHandler(
+        extract=lambda guard, value: value,
+        check=lambda value, expected: value == expected,
+    ),
+    "EMPTY_NN_MODULE_HOOKS_DICT": GuardValueHandler(
+        extract=lambda guard, value: None,
+        check=lambda value, expected: len(value) == 0,
+    ),
+    "NOT_PRESENT_IN_GENERIC_DICT": GuardValueHandler(
+        extract=lambda guard, value: guard.create_fn.keywords["attr"],
+        check=lambda value, expected: expected not in value.__dict__,
+    ),
+    "CONSTANT_MATCH": GuardValueHandler(
+        extract=lambda guard, value: value,
+        check=lambda value, expected: value == expected,
+    ),
+    "ID_MATCH": GuardValueHandler(
+        extract=lambda guard, value: value,
+        check=lambda value, expected: value is expected,
+    ),
+    "CLASS_MATCH": GuardValueHandler(
+        extract=lambda guard, value: value,
+        check=lambda value, expected: value is expected,
+    ),
+    "CLOSURE_MATCH": GuardValueHandler(
+        extract=_extract_closure,
+        check=_check_closure,
+    ),
+    "DICT_CONTAINS": GuardValueHandler(
+        extract=lambda guard, value: (
+            guard.create_fn.keywords["key"],
+            guard.create_fn.keywords["invert"],
+            (guard.create_fn.keywords["key"] not in value)
+            if guard.create_fn.keywords["invert"]
+            else (guard.create_fn.keywords["key"] in value),
+        ),
+        check=lambda value, expected: (
+            ((expected[0] not in value) if expected[1] else (expected[0] in value))
+            == expected[2]
+        ),
+    ),
+    "SEQUENCE_LENGTH": GuardValueHandler(
+        extract=lambda guard, value: len(value),
+        check=lambda value, expected: len(value) == expected,
+    ),
+    "HASATTR": GuardValueHandler(
+        extract=lambda guard, value: (
+            guard.originating_source.member,
+            hasattr(value, guard.originating_source.member),
+        ),
+        check=lambda value, expected: hasattr(value, expected[0]) == expected[1],
+        resolve_base_only=True,
+    ),
+    # Structural guards — skipped during cache build/check
+    "DUPLICATE_INPUT": _SKIP_GUARD,
+    "BUILTIN_MATCH": _SKIP_GUARD,
+    "MODULE_MATCH": _SKIP_GUARD,
+}

@@ -640,6 +640,17 @@ class GuardsSet:
             self.inner: OrderedSet[Guard] = OrderedSet()
         else:
             self.inner = inner
+        # Index: originating_source → guards with that exact source.
+        # Rebuilt from inner in __init__ (for checkpoint restore) and
+        # maintained incrementally in add().
+        self._source_to_guards: dict[Source, list[Guard]] = {}
+        for guard in self.inner:
+            self._index_guard(guard)
+
+    def _index_guard(self, guard: Guard) -> None:
+        source = guard.originating_source
+        if source is not None:
+            self._source_to_guards.setdefault(source, []).append(guard)
 
     def __iter__(self) -> Iterator[Guard]:
         return iter(self.inner)
@@ -666,11 +677,16 @@ class GuardsSet:
         if guard.user_stack is None:
             guard.user_stack = TracingContext.extract_stack()
         self.inner.add(guard)
+        self._index_guard(guard)
 
     def update(self, *others: set[Guard]) -> None:
         for o in others:
             for g in o:
                 self.add(g, skip=1)
+
+    def get_guards_for_source(self, source: Source) -> list[Guard]:
+        """Return all guards with the given originating_source."""
+        return list(self._source_to_guards.get(source, []))
 
     def remove_guards_with_source(self, source: Source) -> None:
         """Delete all guards that contains a given source"""
@@ -679,6 +695,11 @@ class GuardsSet:
         self.inner = OrderedSet(
             g for g in self.inner if not is_from_source(g.originating_source, source)
         )
+        # Rebuild the index since is_from_source walks the chain, so
+        # multiple source keys may need removal.
+        self._source_to_guards = {}
+        for guard in self.inner:
+            self._index_guard(guard)
 
 
 """
@@ -737,6 +758,45 @@ class HopSubgraphCache:
     ) -> tuple[torch.fx.GraphModule | None, int | None]: ...
 
 
+@dataclass
+class AutoCacheEntry:
+    body_name: str
+    body_gmod: Any  # GraphModule
+    config: Any  # NestedCompileRegionOptions | None
+    # Per lifted freevar (in subgraph input order):
+    #   idx >= 0 → came from flat_arg_sources[idx]; data is None
+    #   idx == -1 → captured variable; data is the Source object
+    freevar_mapping: list[tuple[int, Any]]
+    single_tensor_output: bool
+    # Per-output tensor metadata (shape, stride, dtype, device, requires_grad)
+    # cached from the first trace so we can construct fresh FakeTensors on
+    # cache hit without re-running body_gmod.
+    output_metadata: list[tuple[Any, ...]]
+    # Sources of all flattened args/kwargs (positional + keyword) from the
+    # first trace. On cache hit, we build a replacement dict mapping old arg
+    # sources → new arg sources so that captured variable sources can be
+    # rewritten for the current invocation.
+    arg_sources: list[Any]  # list[Source]
+
+
+@dataclass
+class AutoCacheCondition:
+    # Per flattened input VT: (tag, metadata).
+    #   ("tensor", (shape, stride, dtype, device, requires_grad))
+    #   ("symnode", python_type)
+    #   ("constant", value)
+    #   ("module", None)
+    # Tensor metadata is checked here because TENSOR_MATCH guards for
+    # subgraph inputs may already exist before tracing and thus won't
+    # appear in the guard delta.
+    input_checks: list[tuple[str, Any]]
+
+    # Guards captured during the trace (delta + source-mapped).
+    # Each entry: (source, handler, expected_value)
+    # handler is a pre-resolved GuardValueHandler from GUARD_VALUE_DISPATCH.
+    guards: list[tuple[Any, Any, Any]]
+
+
 class InvokeSubgraphCache(HopSubgraphCache):
     def __init__(self) -> None:
         self.autograd_cache: dict[str, Callable] = {}
@@ -748,6 +808,11 @@ class InvokeSubgraphCache(HopSubgraphCache):
         self.effects_cache: dict[
             str, set
         ] = {}  # Maps identifier -> set of effect types
+        # fn_id → list of (condition, cache_entry) pairs. Walked linearly
+        # on lookup; first matching condition wins.
+        self.auto_subgraph_cache: dict[
+            int, list[tuple[AutoCacheCondition, AutoCacheEntry]]
+        ] = defaultdict(list)
 
     def add_dynamo_installed_submodule(self, fn_id: int, identifier: str) -> None:
         self.dynamo_installed_submodules[fn_id].append(identifier)
@@ -801,6 +866,28 @@ class InvokeSubgraphCache(HopSubgraphCache):
     def get_effects(self, identifier: str) -> set | None:
         """Retrieve the effect types for a given invoke_subgraph identifier."""
         return self.effects_cache.get(identifier, None)
+
+    def add_auto_cache_entry(
+        self,
+        fn_id: int,
+        condition: AutoCacheCondition,
+        entry: AutoCacheEntry,
+    ) -> None:
+        self.auto_subgraph_cache[fn_id].append((condition, entry))
+
+    def find_auto_cache_entry(
+        self,
+        fn_id: int,
+        evaluator: Callable[[AutoCacheCondition, AutoCacheEntry], bool],
+    ) -> AutoCacheEntry | None:
+        entries = self.auto_subgraph_cache.get(fn_id, [])
+        for i, (condition, entry) in enumerate(entries):
+            if evaluator(condition, entry):
+                # MRU: move the hit entry to the front for faster future lookups
+                if i > 0:
+                    entries.insert(0, entries.pop(i))
+                return entry
+        return None
 
 
 class HopDispatchSetCache:
